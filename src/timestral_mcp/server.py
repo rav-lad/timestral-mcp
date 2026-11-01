@@ -26,16 +26,22 @@ from pydantic import BaseModel, Field
 from timestral_mcp import __version__
 from timestral_mcp import model as model_mod
 from timestral_mcp.backtesting import (
+    BACKTEST_QUANTILES,
     MAX_BACKTEST_POINTS,
     MAX_WINDOWS,
     BacktestResult,
     Baseline,
     baseline_forecasters,
+    improvement_percent,
+    mae,
     pool,
     run_backtests,
+    split,
+    wape,
 )
 from timestral_mcp.forecasting import (
     MAX_HORIZON,
+    MAX_TARGETS,
     NATIVE_QUANTILES,
     Covariates,
     ForecastResult,
@@ -44,6 +50,7 @@ from timestral_mcp.forecasting import (
     quantile_key,
     run_forecast,
     run_forecast_batch,
+    run_forecast_joint,
     validate_horizon,
     validate_quantiles,
     validate_values,
@@ -121,6 +128,10 @@ dates (attributes per store or product) cannot be used and are reported in warni
 
 Effects of a covariate (e.g. how much a promotion adds): use `compare_scenarios` on one \
 file, never the difference between forecasts of two different files or series.
+
+Several related quantities of one series (e.g. sales and visits): `forecast_multivariate` \
+forecasts the columns jointly, each informed by the others' history. Pass compare_test_size to \
+show the user whether that beats forecasting each column alone on their data.
 
 Gaps: if a file is rejected for missing timestamps, tell the user, and retry with \
 fill_missing_dates=true only if leaving those dates as missing values is acceptable. With \
@@ -1239,6 +1250,239 @@ def compare_scenarios(
             delta_total_p50=_num(alt_total["p50"] - base_total["p50"]),
             warnings=loaded.warnings,
             metadata=_metadata(base, series),
+        )
+
+
+class HoldoutVariable(BaseModel):
+    variable: str
+    joint_mae: float = Field(description="MAE of the median forecast made jointly with the other target columns.")
+    independent_mae: float = Field(description="MAE of the median forecast of this column alone.")
+    joint_wape: float | None
+    independent_wape: float | None
+    mae_improvement_percent: float | None = Field(
+        description="(independent MAE - joint MAE) / independent MAE * 100: positive when the joint forecast did "
+        "better. Null when the independent MAE is 0."
+    )
+
+
+class HoldoutComparison(BaseModel):
+    test_size: int
+    test_start: str
+    test_end: str
+    variables: list[HoldoutVariable]
+    note: str = Field(description="How to read the comparison.")
+
+
+class MultivariateOutput(BaseModel):
+    model: str
+    file: str
+    date_column: str
+    target_columns: list[str]
+    series: str | None
+    frequency: str
+    covariates: CovariateInfo
+    horizon: int
+    last_observation: str
+    forecast: list[dict[str, str | float]] = Field(
+        description="One row per target column and future step: `variable`, `date` and one `pNN` column per "
+        "quantile level (p50 = median)."
+    )
+    totals: dict[str, dict[str, float]] = Field(description="Target column -> " + TOTAL_DESCRIPTION)
+    holdout: HoldoutComparison | None = Field(
+        description="Joint versus one-column-at-a-time forecasts on the last compare_test_size observations, when "
+        "requested."
+    )
+    warnings: list[str] = Field(default_factory=list, description=WARNINGS_DESCRIPTION)
+    metadata: dict[str, ForecastMetadata] = Field(description="Target column -> metadata.")
+
+
+TargetColumns = Annotated[
+    list[str],
+    Field(
+        min_length=2,
+        max_length=MAX_TARGETS,
+        description='Numeric columns to forecast together, e.g. ["sales", "visits"]. They must be observed '
+        "up to the same date. Each is forecast as a target, unlike covariates, which only condition the forecast.",
+    ),
+]
+
+
+def _holdout(
+    values: np.ndarray,
+    covariates: Covariates | None,
+    dates: pd.DatetimeIndex,
+    targets: list[str],
+    test_size: int,
+    model_id: str,
+    device: str,
+) -> HoldoutComparison:
+    """Forecast the last `test_size` steps jointly and column by column, from the same context."""
+    origin = values.shape[1] - test_size
+    for name, row in zip(targets, values, strict=True):
+        try:
+            split(row, origin, test_size)
+        except InputError as e:
+            raise InputError(f"compare_test_size: column {name!r}: {e}") from None
+    if covariates is not None:
+        covariates.window(origin, test_size)
+    context = values[:, :origin]
+    joint = run_forecast_joint(context, test_size, model_id, device, BACKTEST_QUANTILES, covariates)
+    alone = run_forecast_batch([(row, covariates) for row in context], test_size, model_id, device, BACKTEST_QUANTILES)
+    variables = []
+    for name, row, j, a in zip(targets, values, joint, alone, strict=True):
+        actual = row[origin:]
+        scale = float(np.mean(np.abs(actual)))
+        j_mae, a_mae = mae(actual, j.quantiles[0.5]), mae(actual, a.quantiles[0.5])
+        variables.append(
+            HoldoutVariable(
+                variable=name,
+                joint_mae=_num(j_mae),
+                independent_mae=_num(a_mae),
+                joint_wape=_ratio(wape(j_mae, scale)),
+                independent_wape=_ratio(wape(a_mae, scale)),
+                mae_improvement_percent=_pct(improvement_percent(a_mae, j_mae)),
+            )
+        )
+    shown = dates_as_strings(dates[origin:])
+    return HoldoutComparison(
+        test_size=test_size,
+        test_start=shown[0],
+        test_end=shown[-1],
+        variables=variables,
+        note="A single window: a hint of whether the columns help each other on this data, not proof. Use the "
+        "joint forecast when it does clearly better on the columns the user cares about.",
+    )
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def forecast_multivariate(
+    file_path: FilePath = None,
+    *,
+    target_columns: TargetColumns,
+    csv_text: CsvText = None,
+    horizon: Annotated[
+        int | None,
+        Field(ge=1, le=MAX_HORIZON, description="Number of future steps. Default: the series' future rows."),
+    ] = None,
+    date_column: DateColumn = None,
+    series_column: SeriesColumn = None,
+    series_id: Annotated[str | None, Field(description="The series to use, when series_column is given.")] = None,
+    frequency: Frequency = None,
+    fill_missing_dates: FillMissingDates = False,
+    past_covariates: PastCovariates = None,
+    known_covariates: KnownCovariates = None,
+    covariates_files: CovariatesFiles = None,
+    compare_test_size: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            le=MAX_HORIZON,
+            description="Also forecast the last N observations jointly and column by column, and compare their "
+            "errors (holdout), to check whether forecasting the columns together helps on this data.",
+        ),
+    ] = None,
+    sheet: Sheet = None,
+    quantiles: QuantileLevels = None,
+    model: ModelId = None,
+) -> MultivariateOutput:
+    """Forecast several related columns of one series jointly with Timestral's multivariate mode.
+
+    Use it when the user wants forecasts for several quantities that move together (e.g. sales and
+    visits, or demand in two linked regions): the model reads every column's history when
+    forecasting each one, which can help when they are related. `forecast_csv` forecasts one
+    column at a time. Pass compare_test_size to check on recent data whether the joint forecast
+    beats forecasting each column alone. Covariates condition all columns and are not forecast.
+    """
+    with _tool_errors():
+        cfg = settings()
+        model_id = model_mod.resolve_model_id(model, cfg.model)
+        levels = validate_quantiles(quantiles)
+        targets = list(target_columns)
+        if not 2 <= len(targets) <= MAX_TARGETS:
+            raise InputError(f"target_columns must list 2 to {MAX_TARGETS} columns, got {len(targets)}")
+        if len(set(targets)) != len(targets):
+            raise InputError(f"target_columns lists a column more than once: {targets}")
+        clash = sorted(set(targets) & {*(past_covariates or []), *(known_covariates or [])})
+        if clash:
+            raise InputError(f"columns {clash} cannot be both a target and a covariate")
+        if series_column is None and series_id is not None:
+            raise InputError("series_id needs series_column")
+        if series_column is not None and series_id is None:
+            raise InputError("forecast_multivariate uses one series: pass series_id")
+        if horizon is not None:
+            validate_horizon(horizon)
+        # One load per column: each is prepared exactly as forecast_csv would prepare it.
+        loads = [
+            _load_file(
+                file_path,
+                csv_text=csv_text,
+                sheet=sheet,
+                date_column=date_column,
+                target_column=target,
+                frequency=frequency,
+                past_covariates=past_covariates,
+                known_covariates=known_covariates,
+                fill_missing_dates=fill_missing_dates,
+                series_column=series_column,
+                series_ids=None if series_id is None else [series_id],
+                covariates_files=covariates_files,
+            )
+            for target in targets
+        ]
+        for loaded in loads:
+            if loaded.skipped:
+                raise InputError(f"series {loaded.skipped[0].series!r}: {loaded.skipped[0].reason}")
+        prepared = [loaded.series[0].prepared for loaded in loads]
+        first = prepared[0]
+        for name, p in zip(targets[1:], prepared[1:], strict=True):
+            if not p.dates.equals(first.dates):
+                ends = {t: dates_as_strings(s.dates[-1:])[0] for t, s in zip(targets, prepared, strict=True)}
+                raise InputError(
+                    f"columns {targets[0]!r} and {name!r} do not cover the same dates (last values: {ends}); the "
+                    "target columns must be observed up to the same date"
+                )
+        steps = horizon if horizon is not None else first.future_rows
+        if steps == 0:
+            raise InputError("no future rows to forecast; pass horizon or add future rows to the file")
+        validate_horizon(steps)
+        values = np.stack([validate_values(p.values, allow_missing=True) for p in prepared])
+        covariates = first.covariates
+        if covariates is not None:
+            covariates.window(values.shape[1], steps)
+        results = run_forecast_joint(values, steps, model_id, cfg.device, levels, covariates)
+        holdout = None
+        if compare_test_size is not None:
+            holdout = _holdout(values, covariates, first.dates, targets, compare_test_size, model_id, cfg.device)
+
+        dates = future_dates(first, steps)
+        rows: list[dict[str, str | float]] = []
+        for name, result in zip(targets, results, strict=True):
+            for i, date in enumerate(dates):
+                row: dict[str, str | float] = {"variable": name, "date": date}
+                row.update({_column_key(q): _num(v[i]) for q, v in result.quantiles.items()})
+                rows.append(row)
+        warnings = list(loads[0].warnings)
+        if covariates is not None and covariates.categorical:
+            warnings.append(
+                f"Categorical covariates {sorted(covariates.categorical)} were passed to the model as raw category "
+                "codes: with several targets Timestral cannot encode them against one target, so they inform the "
+                "forecast less than in forecast_csv."
+            )
+        return MultivariateOutput(
+            model=model_id,
+            file=loads[0].path,
+            date_column=first.date_column,
+            target_columns=targets,
+            series=loads[0].series[0].label,
+            frequency=first.frequency,
+            covariates=_covariate_info(loads[0]),
+            horizon=steps,
+            last_observation=dates_as_strings(first.dates[-1:])[0],
+            forecast=rows,
+            totals={name: _total(result) for name, result in zip(targets, results, strict=True)},
+            holdout=holdout,
+            warnings=warnings,
+            metadata={name: _metadata(r, p) for name, r, p in zip(targets, results, prepared, strict=True)},
         )
 
 

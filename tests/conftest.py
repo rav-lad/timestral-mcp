@@ -26,7 +26,11 @@ class FakeOutput:
 
 @dataclass
 class FakeForecaster:
-    """Predicts last observed value + 10 * (level - 0.5) for every step; records its inputs."""
+    """Predicts last observed value + 10 * (level - 0.5) for every step; records its inputs.
+
+    A `(B, V, T)` context (joint forecast) is recorded as one `(V, T)` call per series, and each
+    variate gets its own last value.
+    """
 
     quantile_levels: tuple[float, ...] = NATIVE_QUANTILES
     supports_covariates: bool = True
@@ -35,14 +39,15 @@ class FakeForecaster:
     covariate_calls: list[dict[str, np.ndarray]] = field(default_factory=list)
 
     def forecast(self, context: np.ndarray, prediction_length: int, **covariates: np.ndarray) -> FakeOutput:
-        rows = np.atleast_2d(np.array(context))
+        arr = np.array(context)
+        rows = arr if arr.ndim == 3 else np.atleast_2d(arr)[:, None]  # (B, V, T)
         for i, row in enumerate(rows):
-            self.calls.append((row, prediction_length))
-            self.covariate_calls.append({name: arr[i : i + 1] for name, arr in covariates.items()})
+            self.calls.append((row if arr.ndim == 3 else row[0], prediction_length))
+            self.covariate_calls.append({name: a[i : i + 1] for name, a in covariates.items()})
         offsets = torch.tensor([10 * (q - 0.5) for q in self.quantile_levels])
-        q = torch.stack([float(row[~np.isnan(row)][-1]) + offsets for row in rows])  # (B, levels)
-        q = q[:, None, None, :].expand(len(rows), 1, prediction_length, len(self.quantile_levels)).clone()
-        return FakeOutput(quantiles=q)
+        last = torch.tensor([[float(v[~np.isnan(v)][-1]) for v in row] for row in rows])  # (B, V)
+        q = last[:, :, None, None] + offsets  # (B, V, 1, levels)
+        return FakeOutput(quantiles=q.expand(*last.shape, prediction_length, len(self.quantile_levels)).clone())
 
 
 @pytest.fixture

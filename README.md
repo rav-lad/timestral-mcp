@@ -1,10 +1,10 @@
 # timestral-mcp
 
-An [MCP](https://modelcontextprotocol.io/) server that lets Claude (Claude Code, Claude Desktop) and
-other MCP clients forecast time series locally with Mistral AI's
-[Timestral](https://github.com/mistralai/timestral) models.
+An [MCP](https://modelcontextprotocol.io/) server that lets any MCP-compatible agent or client
+(Claude Code, Claude Desktop, Cursor, VS Code, Codex, custom agents, …) forecast time series locally
+with Mistral AI's [Timestral](https://github.com/mistralai/timestral) models.
 
-Ask *"Forecast the next 30 days of sales from sales.csv"* and the assistant runs Timestral on your
+Ask *"Forecast the next 30 days of sales from sales.csv"* and the agent runs Timestral on your
 machine and returns quantile forecasts. No Python, no tensors, no data sent anywhere.
 
 > An independent project, not affiliated with or endorsed by Mistral AI.
@@ -17,6 +17,7 @@ machine and returns quantile forecasts. No Python, no tensors, no data sent anyw
 | `forecast_csv` | Forecasts a column of a CSV or Excel file: detects the date and target columns and the frequency, and returns dated forecasts with their total. Handles covariates, several series per file and writing results to a CSV file. |
 | `backtest` | Measures how the model would have done on the most recent data (one or several rolling windows) with MAE, RMSE, WAPE and interval coverage, compared with simple baselines. |
 | `compare_scenarios` | What-if analysis: forecasts a series with a covariate as planned and as changed (e.g. `{"promo": 0}`), and reports the difference. |
+| `forecast_multivariate` | Forecasts several related columns of one series together (e.g. sales and visits) with Timestral's multivariate mode, each informed by the others' history. Can also compare, on the most recent data, the joint forecast with forecasting each column alone. |
 
 Results are **quantile forecasts**: `p50` is the median, `[p10, p90]` an 80% prediction interval.
 Any of Timestral's 21 native levels (0.01, 0.05, 0.1, …, 0.95, 0.99) can be requested.
@@ -29,6 +30,15 @@ Any of Timestral's 21 native levels (0.01, 0.05, 0.1, …, 0.95, 0.99) can be re
   `Timestral-28M`). On a CPU laptop a forecast takes a fraction of a second once the model is loaded.
 
 ## Installation
+
+The server speaks MCP over stdio, so any MCP client can run it. The command is always:
+
+```bash
+uvx --from git+https://github.com/rav-lad/timestral-mcp timestral-mcp
+```
+
+Register it in your client's MCP configuration (usually an `mcpServers` entry with `command` and
+`args`). Examples for two common clients:
 
 ### Claude Code
 
@@ -91,6 +101,9 @@ overwrites a file: `forecast.csv` becomes `forecast (2).csv` if it already exist
 
 > How many extra sales do the promotions planned in sales.csv bring over the next two weeks?
 
+> Forecast sales and visits from shop.csv together for the next 14 days, and check on the last 30 days
+> whether that beats forecasting them separately.
+
 > Forecast the next 6 values of this series: 112, 118, 132, 129, 121, 135, 148, 148, 136, 119.
 
 ## How data is handled
@@ -110,10 +123,21 @@ overwrites a file: `forecast.csv` becomes `forecast (2).csv` if it already exist
 
 ## Limitations
 
-- Forecasts can be wrong. Run `backtest` on your own data before relying on them.
-- Only the CPU path has been tested.
-- Large files (thousands of series) can take minutes on a CPU, and some clients may time out.
-- Series are forecast independently; Timestral's multivariate mode is not exposed.
+- **Forecasts can be wrong.** Timestral is a statistical model: it extrapolates patterns from the
+  past and cannot anticipate events absent from the data. Run `backtest` on your own data before
+  relying on the results.
+- **CPU only is tested.** `TIMESTRAL_DEVICE=cuda` exists but has not been verified.
+- **Large files are slow.** Files with thousands of series can take minutes on a CPU, and some
+  clients time out on long tool calls.
+- **Multivariate mode is limited to one series at a time.** `forecast_multivariate` forecasts up to
+  10 columns of one series jointly, but the series of a long-format file (`series_column`, e.g.
+  stores) are still forecast independently of each other. It does not take `aggregate_by`,
+  `future_file` or `output_file`, and its comparison with independent forecasts uses a single
+  window. Categorical covariates are passed as raw codes in this mode, so they carry less signal.
+- **Regular grid required.** Dates must be evenly spaced, from 15 minutes to yearly. Irregular
+  data must be resampled first, or gaps filled with `fill_missing_dates=true`.
+- **Local files only.** Data must be in the allowed folders as CSV or Excel; there is no database
+  or URL input for now .
 
 ## Development
 

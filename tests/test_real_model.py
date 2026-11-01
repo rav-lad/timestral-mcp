@@ -9,7 +9,7 @@ import pytest
 
 from timestral_mcp import model as model_mod
 from timestral_mcp import server
-from timestral_mcp.forecasting import NATIVE_QUANTILES, run_forecast, validate_values
+from timestral_mcp.forecasting import NATIVE_QUANTILES, run_forecast, run_forecast_joint, validate_values
 
 pytestmark = pytest.mark.model
 
@@ -86,3 +86,15 @@ def test_real_rolling_backtest_and_known_covariates(data_dir):
         assert [w.context_size for w in bt.windows] == [309, 323, 337, 351]
         assert len(bt.predictions) == 56
         assert np.isfinite([w.mae for w in bt.windows]).all()
+
+
+def test_real_joint_forecast(series):
+    related = np.stack([series, 2 * series + 5])
+    results = run_forecast_joint(related, 12, model_mod.DEFAULT_MODEL, "cpu", NATIVE_QUANTILES)
+    assert len(results) == 2
+    for result in results:
+        stacked = np.stack([result.quantiles[q] for q in NATIVE_QUANTILES], axis=-1)
+        assert stacked.shape == (12, 21) and np.isfinite(stacked).all()
+        assert (np.diff(stacked, axis=-1) >= 0).all()
+    # the second variate is about twice the first: a sanity check on the variate order
+    assert results[1].quantiles[0.5].mean() > 1.5 * results[0].quantiles[0.5].mean()

@@ -1,10 +1,14 @@
-"""Univariate Timestral inference: input validation, covariates, the model call and quantile extraction."""
+"""Timestral inference: input validation, covariates, the model call and quantile extraction.
+
+Series are forecast one variate at a time (batched), or several variates jointly (`run_forecast_joint`).
+"""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -19,6 +23,8 @@ MAX_INPUT_LENGTH = 100_000
 MAX_HORIZON = 4096
 # Series forecast together in one model call; bounds memory, not results.
 MAX_BATCH = 256
+# Target columns forecast jointly (multivariate mode); every variate attends to every other.
+MAX_TARGETS = 10
 DEFAULT_QUANTILES = (0.1, 0.5, 0.9)
 # The 21 quantile levels produced by every released Timestral checkpoint (config.json
 # `quantile_knots`). The levels of the loaded checkpoint are re-checked at inference.
@@ -221,17 +227,9 @@ def run_forecast_batch(
     cov_args = [cov.window(values.size, horizon) if cov is not None else {} for values, cov in items]
     if len({tuple(sorted(args)) for args in cov_args}) != 1:
         raise ValueError("a batch must hold series with the same covariate columns")
-    if cov_args[0] and not forecaster.supports_covariates:
-        raise InputError(f"checkpoint {model_id} was not trained with covariates")
-    if any(cov is not None and cov.known for _, cov in items) and not forecaster.supports_known_covariates:
-        raise InputError(f"checkpoint {model_id} cannot condition on known-future covariates")
+    _check_covariate_support(forecaster, model_id, bool(cov_args[0]), any(c is not None and c.known for _, c in items))
     levels = tuple(forecaster.quantile_levels)
-    indices = []
-    for q in quantiles:
-        idx = next((i for i, n in enumerate(levels) if math.isclose(q, n, abs_tol=1e-9)), None)
-        if idx is None:
-            raise InputError(f"quantile {q} is not produced by checkpoint {model_id}; it provides {levels}")
-        indices.append(idx)
+    indices = _quantile_indices(levels, quantiles, model_id)
 
     results = []
     for start in range(0, len(items), MAX_BATCH):
@@ -258,3 +256,64 @@ def run_forecast_batch(
                 )
             )
     return results
+
+
+def run_forecast_joint(
+    values: np.ndarray,
+    horizon: int,
+    model_id: str,
+    device: str,
+    quantiles: Sequence[float] = DEFAULT_QUANTILES,
+    covariates: Covariates | None = None,
+) -> list[ForecastResult]:
+    """Forecast the V variates of one series jointly: `values` is `(V, T)`, NaN = missing.
+
+    Timestral reads every variate when forecasting each of them (multivariate mode), so a
+    variate's forecast can use the others' histories. Returns one result per variate, in
+    order. Covariates are shared by all variates; categorical ones are not target-encoded,
+    since there is no single target to encode them against.
+    """
+    if values.ndim != 2 or not 2 <= values.shape[0] <= MAX_TARGETS:
+        raise ValueError(f"a joint forecast needs 2 to {MAX_TARGETS} variates, got shape {values.shape}")
+    forecaster = model_mod.get_forecaster(model_id, device)
+    cov_args = covariates.window(values.shape[1], horizon) if covariates is not None else {}
+    _check_covariate_support(forecaster, model_id, bool(cov_args), covariates is not None and bool(covariates.known))
+    levels = tuple(forecaster.quantile_levels)
+    indices = _quantile_indices(levels, quantiles, model_id)
+
+    with model_mod.inference_lock:
+        out = forecaster.forecast(values[None].astype(np.float32), prediction_length=horizon, **cov_args)
+    # (series=1, variates, horizon, levels) -> (variates, horizon, levels)
+    q = out.quantiles[0].detach().to("cpu").double().numpy()
+    if q.shape != (values.shape[0], horizon, len(levels)) or not np.isfinite(q).all():
+        raise RuntimeError(f"Timestral returned an invalid forecast of shape {q.shape}")
+    return [
+        ForecastResult(
+            model=model_id,
+            device=device,
+            horizon=horizon,
+            quantiles={level: row[:, i] for level, i in zip(quantiles, indices, strict=True)},
+            input_length=int(variate.size),
+            context_length=int(min(variate.size, MODEL_CONTEXT_LENGTH)),
+            missing_values=int(np.isnan(variate).sum()),
+        )
+        for row, variate in zip(q, values, strict=True)
+    ]
+
+
+def _check_covariate_support(forecaster: Any, model_id: str, any_covariates: bool, any_known: bool) -> None:
+    if any_covariates and not forecaster.supports_covariates:
+        raise InputError(f"checkpoint {model_id} was not trained with covariates")
+    if any_known and not forecaster.supports_known_covariates:
+        raise InputError(f"checkpoint {model_id} cannot condition on known-future covariates")
+
+
+def _quantile_indices(levels: tuple[float, ...], quantiles: Sequence[float], model_id: str) -> list[int]:
+    """Position of each requested level among the checkpoint's `levels`."""
+    indices = []
+    for q in quantiles:
+        idx = next((i for i, n in enumerate(levels) if math.isclose(q, n, abs_tol=1e-9)), None)
+        if idx is None:
+            raise InputError(f"quantile {q} is not produced by checkpoint {model_id}; it provides {levels}")
+        indices.append(idx)
+    return indices

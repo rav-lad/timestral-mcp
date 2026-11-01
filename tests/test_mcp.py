@@ -13,7 +13,7 @@ from timestral_mcp import server
 
 pytestmark = pytest.mark.anyio
 
-TOOLS = {"forecast", "forecast_csv", "backtest", "compare_scenarios"}
+TOOLS = {"forecast", "forecast_csv", "backtest", "compare_scenarios", "forecast_multivariate"}
 
 
 def error_text(result) -> str:
@@ -33,6 +33,7 @@ async def test_tools_are_discoverable():
     assert {name for name, tool in tools.items() if tool.annotations.read_only_hint} == {
         "forecast",
         "compare_scenarios",
+        "forecast_multivariate",
     }
     assert tools["forecast"].input_schema["required"] == ["values", "horizon"]
     # file_path or csv_text: neither is required on its own
