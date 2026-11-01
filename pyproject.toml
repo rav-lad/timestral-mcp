@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "timestral-mcp"
+version = "0.1.0"
+description = "MCP server for local time-series forecasting with Mistral AI's Timestral models"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "rav-lad" }]
+keywords = ["mcp", "model-context-protocol", "forecasting", "time-series", "timestral", "claude"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "mcp>=2.3,<3",
+    "numpy>=1.24",
+    "openpyxl>=3.1",
+    "pandas>=2.1",
+    "pydantic>=2.7",
+    "torch>=2.4",
+    # Timestral is not published on PyPI; it is pinned to a reviewed upstream commit.
+    "timestral @ git+https://github.com/mistralai/timestral@a534bdbd244d64f3d9d743f46c7bf6fc330ed4ff",
+]
+
+[project.urls]
+Homepage = "https://github.com/rav-lad/timestral-mcp"
+Issues = "https://github.com/rav-lad/timestral-mcp/issues"
+Timestral = "https://github.com/mistralai/timestral"
+
+[project.scripts]
+timestral-mcp = "timestral_mcp.server:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", "LICENSE"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/timestral_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["model: runs real Timestral inference (downloads weights); run with `pytest -m model`"]
+addopts = "-m 'not model'"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
